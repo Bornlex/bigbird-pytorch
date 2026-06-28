@@ -1,115 +1,99 @@
-# BigBird (PyTorch port)
+# BigBird (PyTorch)
 
-A faithful PyTorch translation of Google's official TensorFlow
-[BigBird](https://arxiv.org/abs/2007.14062) implementation. The module layout,
-layer names and computation mirror the original so the two can be cross-checked
-and TF checkpoints can be converted.
+A clean PyTorch implementation of [BigBird](https://arxiv.org/abs/2007.14062),
+the sparse-attention transformer that scales to long sequences (up to 4096
+tokens). It builds on PyTorch built-ins (`nn.Linear`, `nn.LayerNorm`,
+`nn.Embedding`, SDPA, `AdamW`) and keeps the only genuinely custom piece — the
+linear-time block-sparse attention kernel.
 
-## Layout
+The code is split into two **self-contained** packages so you only read what
+the task needs:
 
 ```
-core/
-  utils.py         # dense/embedding/norm layers, activations, default config
-  attention.py     # MultiHeadedAttentionLayer + block-sparse attention kernel
-  encoder.py       # Pre/Postnorm encoder layers + EncoderStack
-  decoder.py       # Pre/Postnorm decoder layers + DecoderStack + greedy decode
-  beam_search.py   # beam search (ported from Pegasus)
-  optimization.py  # AdamWeightDecay optimizer + LR schedules
-  flags.py         # config helpers (replaces absl flags)
-pretrain/
-  run_pretraining.py  # MLM + NSP heads, whole-word masking, training loop
-test_smoke.py      # shape/grad/decode smoke tests
+mlm/           # encoder-only BigBird for masked language modeling
+  config.py            # MLMConfig
+  attention.py         # block-sparse kernel + full attention (SDPA)
+  modeling.py          # embeddings, encoder, BigBirdModel, BigBirdForMaskedLM
+  data.py              # whole-word masking + Dataset
+  run_pretraining.py   # training loop (AdamW + linear warmup/decay)
+  test_smoke.py
+
+transformer/   # encoder-decoder BigBird for generative (seq2seq) tasks
+  config.py            # TransformerConfig
+  attention.py         # block-sparse + full attention (self/cross, with cache)
+  modeling.py          # embeddings, encoder, decoder, TransformerModel
+  beam_search.py
+  test_smoke.py
 ```
 
-## What was translated
+The two `attention.py` files share the block-sparse kernel by design — the
+duplication keeps each package readable on its own.
 
-| TF concept | PyTorch equivalent |
-|---|---|
-| `tf.keras.layers.Layer` | `torch.nn.Module` |
-| `tf.compat.v1.get_variable` | `nn.Parameter` (+ truncated-normal init) |
-| `tf.einsum` | `torch.einsum` (same subscripts) |
-| `tf.gather(..., batch_dims=k)` | `attention.batched_index_gather` |
-| `tf.nn.batch_normalization` (layer norm) | `utils.NormLayer` |
-| `RecomputingDropout` | `nn.Dropout` |
-| `recompute_grad` / gradient checkpointing | `torch.utils.checkpoint.checkpoint` |
-| `tf.while_loop` beam/greedy decode | plain Python loops over tensors |
-| `AdamWeightDecayOptimizer` | `optimization.AdamWeightDecayOptimizer` |
-
-## Usage
+## Masked LM (encoder-only)
 
 ```python
 import torch
-from core import modeling, utils
+from mlm.config import MLMConfig
+from mlm.modeling import BigBirdForMaskedLM
 
-params = utils.get_default_config()
-params.update(dict(
-    vocab_size=32000,
-    hidden_size=768,
-    num_hidden_layers=12,
-    num_attention_heads=12,
-    intermediate_size=3072,
-    max_encoder_length=1024,
-    attention_type="block_sparse",   # or "original_full" / "simulated_sparse"
-    block_size=16,
-    num_rand_blocks=3,
-))
+config = MLMConfig(vocab_size=32000, max_encoder_length=1024,
+                   attention_type="block_sparse")   # or "original_full"
+model = BigBirdForMaskedLM(config)
 
-model = modeling.BertModel(params).eval()
-input_ids = torch.randint(1, params["vocab_size"], (2, 1024))
-sequence_output, pooled_output = model(input_ids)
+out = model(
+    input_ids=torch.randint(1, 32000, (2, 1024)),
+    masked_lm_positions=torch.randint(0, 1024, (2, 75)),
+    masked_lm_ids=torch.randint(1, 32000, (2, 75)),
+    masked_lm_weights=torch.ones(2, 75))
+out["loss"].backward()
 ```
 
-Encoder-decoder (summarization-style) model:
-
-```python
-model = modeling.TransformerModel(params)
-# training (teacher forcing):
-(log_probs, logits, pred_ids), enc = model(input_ids, target_ids, training=True)
-# inference (beam search):
-(log_probs, logits, pred_ids), enc = model(input_ids, target_ids, training=False)
-```
-
-## Pre-training
-
-`pretrain/run_pretraining.py` ports the masked-LM (+ optional NSP) objective.
-The TF data pipeline (TFRecords / tfds / TPUEstimator) is replaced by a plain
-`torch.utils.data.Dataset` that tokenizes and whole-word-masks raw text on the
-fly, plus a standard training loop.
+Pre-train from raw text (one document per line, SentencePiece vocab):
 
 ```bash
-python -m pretrain.run_pretraining \
+python -m mlm.run_pretraining \
     --input_file docs.txt \
-    --vocab_model_file vocab/pegasus.model \
+    --vocab_model_file vocab.model \
     --output_dir /tmp/bigb \
-    --max_encoder_length 512 \
+    --max_encoder_length 1024 \
     --train_batch_size 4 \
     --num_train_steps 100000
 ```
 
-`docs.txt` is UTF-8 text, one document per line. The heads
-(`MaskedLMLayer`, `NSPLayer`, `BigBirdForPreTraining`) are importable on their
-own if you want to plug them into a custom loop.
+## Seq2seq (encoder-decoder)
 
-## Notes & fidelity caveats
+```python
+import torch
+from transformer.config import TransformerConfig
+from transformer.modeling import TransformerModel
 
-- **Attention types.** `original_full` and `block_sparse` are fully exercised by
-  the smoke tests at arbitrary lengths. `simulated_sparse` reproduces the
-  original exactly, including the original's constraint that the dense mask is
-  built over the full `MAX_SEQ_LEN` (4096) grid — so it is only valid when
-  `max_encoder_length == 4096` (same limitation as the TF code).
-- **GELU** uses the tanh approximation, matching the original.
-- **LayerNorm** uses biased variance and `eps=1e-12` (`1e-3` for fp16) to match
-  `tf.nn.moments` + `tf.nn.batch_normalization`.
-- **Dropout** follows PyTorch semantics (`model.train()` / `model.eval()`); the
-  `training=` kwargs are kept for signature parity.
-- **Checkpoint conversion.** Parameter *structure* matches the TF model, but TF
-  variable names (e.g. `bert/encoder/layer_0/attention/self/query/kernel`)
-  differ from PyTorch's dotted `state_dict` keys. A name-mapping script is
-  required to load TF checkpoints; the 1:1 layer correspondence makes this
-  mechanical.
+config = TransformerConfig(vocab_size=32000, max_encoder_length=1024,
+                           max_decoder_length=64, beam_size=5)
+model = TransformerModel(config)
+
+input_ids = torch.randint(1, 32000, (2, 1024))
+target_ids = torch.randint(1, 32000, (2, 64))
+
+out = model(input_ids, target_ids, training=True)   # teacher forcing
+out["loss"].backward()
+
+pred_ids = model(input_ids, training=False)["pred_ids"]   # beam search
+```
+
+## Notes
+
+- **Attention.** For `max_encoder_length <= 512` the model falls back to full
+  attention automatically (it's the standard BERT/RoBERTa setup at that point).
+  Block-sparse pads the sequence up to a multiple of `block_size`.
+- **GELU** uses the tanh approximation; **LayerNorm** uses `eps=1e-12`.
+- **norm_type** is `postnorm` (BERT/RoBERTa) by default; set `prenorm` for the
+  Pegasus-style setup (more stable when training from scratch).
+- **Checkpoints.** This is a from-scratch implementation; loading the official
+  TF BigBird weights would need a name-mapping script (not included yet).
 
 ## Tests
 
 ```bash
-python test_smoke.py
+python -m mlm.test_smoke
+python -m transformer.test_smoke
 ```
