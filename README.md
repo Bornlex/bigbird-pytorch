@@ -60,6 +60,41 @@ python -m mlm.run_pretraining \
     --num_train_steps 100000
 ```
 
+## Loading pretrained weights
+
+`mlm/convert_checkpoint.py` warm-starts the encoder-only model from a
+HuggingFace checkpoint (no TensorFlow needed). The encoder/FFN/LayerNorm weights
+are shape-identical to ours and, since both sides use `nn.Linear`, copy across
+with no transpose.
+
+```bash
+pip install transformers          # optional, only for this script
+
+# Best starting point: already 4096-ctx and sparse-trained.
+python -m mlm.convert_checkpoint --source google/bigbird-roberta-base \
+    --output bigbird_init.pt
+
+# Or warm-start from vanilla RoBERTa (512 positions are tiled up to 4096),
+# then adapt with sparse attention -- the original BigBird recipe.
+python -m mlm.convert_checkpoint --source roberta-base \
+    --output roberta_init.pt --max_position_embeddings 4096
+```
+
+```python
+import torch
+from mlm.modeling import BigBirdForMaskedLM
+ckpt = torch.load("bigbird_init.pt")
+model = BigBirdForMaskedLM(ckpt["config"])
+model.load_state_dict(ckpt["state_dict"])
+```
+
+Gotchas the script handles: position-embedding offset/tiling (RoBERTa starts at
+index 2 and has only 512 rows), the embedding-LayerNorm ↔ encoder-norm
+correspondence, and the gelu variant (exact for RoBERTa, tanh for BigBird). The
+**tokenizer must match the word embeddings** — use RoBERTa's BPE with
+`roberta-base`, and BigBird's SentencePiece with `google/bigbird-roberta-base`.
+The pooler is not warm-started (it's unused for MLM).
+
 ## Seq2seq (encoder-decoder)
 
 ```python

@@ -288,7 +288,8 @@ class MultiHeadAttention(nn.Module):
     self.value = nn.Linear(hidden, hidden, bias=config.use_bias)
     self.dropout = config.attention_probs_dropout_prob
     if config.attention_type == "block_sparse":
-      self.register_buffer("rand_attn", build_rand_attn(config, seed))
+      self.register_buffer("rand_attn", build_rand_attn(config, seed),
+                           persistent=False)
 
   def _split(self, x):
     b, s, _ = x.shape

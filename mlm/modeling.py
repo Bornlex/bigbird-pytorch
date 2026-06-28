@@ -11,7 +11,8 @@ from mlm.attention import MultiHeadAttention, create_band_mask
 
 def get_activation(name):
   return {
-      "gelu": lambda x: F.gelu(x, approximate="tanh"),
+      "gelu": lambda x: F.gelu(x, approximate="tanh"),  # BigBird / gelu_new
+      "gelu_exact": F.gelu,                              # RoBERTa / BERT
       "relu": F.relu,
       "tanh": torch.tanh,
       "linear": lambda x: x,

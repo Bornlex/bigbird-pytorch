@@ -1,3 +1,4 @@
 torch>=2.0          # scaled_dot_product_attention
 numpy
 sentencepiece       # only for mlm/run_pretraining.py tokenization
+transformers        # only for mlm/convert_checkpoint.py
