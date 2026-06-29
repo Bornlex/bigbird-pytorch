@@ -1,14 +1,18 @@
-"""BigBird attention: full (via SDPA) and linear-time block-sparse."""
+"""BigBird attention: block-sparse encoder self-attention and full attention
+(decoder self/cross, with an incremental cache)."""
 
-import numpy as np
+import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 
-MAX_SEQ_LEN = 4096
+from transformer.config import TransformerConfig
 
 
-def batched_index_gather(params, indices, batch_dims):
+def batched_index_gather(params: Tensor, indices: Tensor, batch_dims: int) -> Tensor:
   """tf.gather(params, indices, batch_dims=k, axis=k) in PyTorch.
 
   params:  [B_0..B_{k-1}, N, *E]
@@ -18,8 +22,8 @@ def batched_index_gather(params, indices, batch_dims):
   batch_shape = list(params.shape[:batch_dims])
   n, e_shape = params.shape[batch_dims], list(params.shape[batch_dims + 1:])
   idx_shape = list(indices.shape[batch_dims:])
-  bsz = int(np.prod(batch_shape)) if batch_shape else 1
-  isz = int(np.prod(idx_shape)) if idx_shape else 1
+  bsz = math.prod(batch_shape) if batch_shape else 1
+  isz = math.prod(idx_shape) if idx_shape else 1
 
   params_flat = params.reshape([bsz, n] + e_shape)
   indices_flat = indices.reshape(bsz, isz).long()
@@ -28,256 +32,161 @@ def batched_index_gather(params, indices, batch_dims):
   return gathered.reshape(batch_shape + idx_shape + e_shape)
 
 
-# --------------------------------------------------------------------------- #
-# Random-block adjacency construction (numpy, run once at init).
-# --------------------------------------------------------------------------- #
+def build_rand_attn(config: TransformerConfig, seed: int) -> Tensor:
+  """Random-block adjacency, shape [num_heads, num_blocks - 2, num_rand_blocks].
 
-def _single_block_row_attention(block_id, to_start, to_end, num_rand_blocks,
-                                window_left=1, window_right=1,
-                                global_left=1, global_right=1):
-  to_blocks = np.arange(to_start, to_end, dtype=np.int32)
-  perm = np.random.permutation(to_blocks)
-
-  illegal = list(range(block_id - window_left, block_id + window_right + 1))
-  illegal += list(range(global_left))
-  illegal += list(range(to_end - global_right, to_end))
-  if block_id == 1:
-    illegal.append(to_end - 2)
-  if block_id == to_end - 2:
-    illegal.append(1)
-
-  selected = []
-  for i in range(to_end - to_start):
-    if perm[i] not in illegal:
-      selected.append(perm[i])
-    if len(selected) == num_rand_blocks:
-      break
-  return np.array(selected, dtype=np.int32)
-
-
-def _rand_attn_plan(from_seq_length, from_block_size, num_rand_blocks):
-  lengths, counts = [], []
-  num_blocks = from_seq_length // from_block_size
-  if 2 * num_rand_blocks + 5 < num_blocks:
-    lengths += [(2 * num_rand_blocks + 5) * from_block_size, from_seq_length]
-    counts += [num_rand_blocks, 0]
-  elif num_rand_blocks + 5 < num_blocks:
-    lengths += [(num_rand_blocks + 5) * from_block_size, from_seq_length]
-    counts += [num_rand_blocks // 2, num_rand_blocks - num_rand_blocks // 2]
-  else:
-    lengths += [from_seq_length]
-    counts += [num_rand_blocks]
-  return lengths, counts
-
-
-def _block_rand_mask_with_head(seq_length, block_size, num_heads,
-                               plan_from_length, plan_num_rand_blocks,
-                               global_top=1, global_bottom=1):
-  num_blocks = seq_length // block_size
-  plan_block_length = np.array(plan_from_length) // block_size
-  max_plan_idx = plan_from_length.index(seq_length)
-  rand_attn = [
-      np.zeros((num_blocks, np.sum(plan_num_rand_blocks[:max_plan_idx + 1])),
-               dtype=np.int32) for _ in range(num_heads)
-  ]
-
-  for plan_idx in range(max_plan_idx + 1):
-    if plan_idx > 0:
-      if plan_num_rand_blocks[plan_idx] > 0:
-        a = int(np.sum(plan_num_rand_blocks[:plan_idx]))
-        b = int(np.sum(plan_num_rand_blocks[:plan_idx + 1]))
-        for blk in range(global_top, plan_block_length[plan_idx - 1]):
-          for h in range(num_heads):
-            rand_attn[h][blk, a:b] = _single_block_row_attention(
-                blk, plan_block_length[plan_idx - 1],
-                plan_block_length[plan_idx], plan_num_rand_blocks[plan_idx])
-      for pl_id in range(plan_idx):
-        if plan_num_rand_blocks[pl_id] == 0:
-          continue
-        for blk in range(plan_block_length[plan_idx - 1],
-                         plan_block_length[plan_idx]):
-          a, to_start = 0, 0
-          if pl_id > 0:
-            a = int(np.sum(plan_num_rand_blocks[:pl_id]))
-            to_start = plan_block_length[pl_id - 1]
-          b = int(np.sum(plan_num_rand_blocks[:pl_id + 1]))
-          for h in range(num_heads):
-            rand_attn[h][blk, a:b] = _single_block_row_attention(
-                blk, to_start, plan_block_length[pl_id],
-                plan_num_rand_blocks[pl_id])
-
-    if plan_num_rand_blocks[plan_idx] == 0:
-      continue
-    b = int(np.sum(plan_num_rand_blocks[:plan_idx + 1]))
-    from_start, to_start, a = global_top, 0, 0
-    if plan_idx > 0:
-      a = int(np.sum(plan_num_rand_blocks[:plan_idx]))
-      from_start = to_start = plan_block_length[plan_idx - 1]
-    for blk in range(from_start, plan_block_length[plan_idx]):
-      for h in range(num_heads):
-        rand_attn[h][blk, a:b] = _single_block_row_attention(
-            blk, to_start, plan_block_length[plan_idx],
-            plan_num_rand_blocks[plan_idx])
-
-  return [r[global_top:num_blocks - global_bottom, :] for r in rand_attn]
-
-
-def _block_rand_mask(from_seq_length, to_seq_length, from_block_size,
-                     to_block_size, num_rand_blocks, last_idx=-1):
-  rand_attn = np.zeros(
-      (from_seq_length // from_block_size - 2, num_rand_blocks), dtype=np.int32)
-  middle = np.arange(1, to_seq_length // to_block_size - 1, dtype=np.int32)
-  last = to_seq_length // to_block_size - 1
-  if last_idx > 2 * to_block_size:
-    last = (last_idx // to_block_size) - 1
-
-  r = num_rand_blocks
-  nblk = from_seq_length // from_block_size
-  for i in range(1, nblk - 1):
-    start, end = i - 2, i
-    if i == 1:
-      rand_attn[i - 1] = np.random.permutation(middle[2:last])[:r]
-    elif i == 2:
-      rand_attn[i - 1] = np.random.permutation(middle[3:last])[:r]
-    elif i in (nblk - 3, nblk - 2):
-      rand_attn[i - 1] = np.random.permutation(middle[:last])[:r]
-    elif start > last:
-      rand_attn[i - 1] = np.random.permutation(middle[:last])[:r]
-    elif end + 1 == last:
-      rand_attn[i - 1] = np.random.permutation(middle[:start])[:r]
-    else:
-      rand_attn[i - 1] = np.random.permutation(
-          np.concatenate((middle[:start], middle[end + 1:last])))[:r]
+  Row `r` is query block `r + 1` (the two global blocks have no random row). Each
+  query block picks `num_rand_blocks` key blocks spread across the sequence,
+  excluding the global blocks (first/last) and its own sliding window so they are
+  never double-counted in the softmax.
+  """
+  num_blocks = config.max_encoder_length // config.block_size
+  r = config.num_rand_blocks
+  gen = torch.Generator().manual_seed(seed)
+  rand_attn = torch.zeros(config.num_attention_heads, num_blocks - 2, r,
+                          dtype=torch.long)
+  for head in range(config.num_attention_heads):
+    for row in range(num_blocks - 2):
+      i = row + 1
+      window = {i - 1, i, i + 1}
+      candidates = torch.tensor(
+          [j for j in range(1, num_blocks - 1) if j not in window])
+      pick = torch.randperm(candidates.numel(), generator=gen)[:r]
+      rand_attn[head, row] = candidates[pick]
   return rand_attn
 
 
-def build_rand_attn(config, seed):
-  """Per-head random-block adjacency, shape [num_heads, num_blocks-2, r]."""
-  np.random.seed(seed)
-  n = config.max_encoder_length
-  bs = config.block_size
-  if n in (1024, 2048, 3072, 4096):
-    rand_attn = [
-        _block_rand_mask(MAX_SEQ_LEN, MAX_SEQ_LEN, bs, bs,
-                         config.num_rand_blocks, last_idx=1024)[:(n // bs - 2)]
-        for _ in range(config.num_attention_heads)
-    ]
-  else:
-    plan_len, plan_cnt = _rand_attn_plan(n, bs, config.num_rand_blocks)
-    rand_attn = _block_rand_mask_with_head(
-        n, bs, config.num_attention_heads, plan_len, plan_cnt)
-  return torch.tensor(np.stack(rand_attn, 0), dtype=torch.long)
-
-
-# --------------------------------------------------------------------------- #
-# Mask helpers (tensor).
-# --------------------------------------------------------------------------- #
-
-def create_band_mask(blocked_mask):
+def create_band_mask(blocked_mask: Tensor) -> Tensor:
+  """Window padding mask for interior blocks (the 3 sliding blocks)."""
   exp = torch.cat([blocked_mask[:, 1:-3], blocked_mask[:, 2:-2],
                    blocked_mask[:, 3:-1]], 2)
   band = torch.einsum("blq,blk->blqk", blocked_mask[:, 2:-2], exp)
   return band.unsqueeze(1)
 
 
-def _create_rand_mask(blocked_mask, rand_attn, num_heads, r, from_block_size):
+def _create_rand_mask(
+    blocked_mask: Tensor,
+    rand_attn: Tensor,
+    num_heads: int,
+    num_rand_blocks: int,
+    block_size: int,
+) -> Tensor:
+  """Padding mask for the gathered random blocks."""
   num_windows = blocked_mask.shape[1] - 2
   rand_mask = batched_index_gather(blocked_mask, rand_attn, batch_dims=1)
-  rand_mask = rand_mask.reshape(-1, num_heads, num_windows, r * from_block_size)
+  rand_mask = rand_mask.reshape(-1, num_heads, num_windows,
+                                num_rand_blocks * block_size)
   return torch.einsum("blq,bhlk->bhlqk", blocked_mask[:, 1:-1], rand_mask)
 
 
-# --------------------------------------------------------------------------- #
-# Block-sparse attention kernel.
-# --------------------------------------------------------------------------- #
+def block_sparse_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    band_mask: Tensor,
+    from_mask: Tensor,
+    to_mask: Tensor,
+    blocked_mask: Tensor,
+    rand_attn: Tensor,
+    num_heads: int,
+    head_size: int,
+    num_rand_blocks: int,
+    seq_length: int,
+    block_size: int,
+) -> Tensor:
+  """BigBird attention = window + global + random, per block.
 
-def block_sparse_attention(q, k, v, band_mask, from_mask, to_mask,
-                           blocked_mask, rand_attn, num_heads, head_size,
-                           num_rand_blocks, seq_length, block_size):
-  """q, k, v: [b, h, seq, d]. Returns [b, seq, h, d]."""
+  q, k, v: [b, h, seq, d]. Returns [b, seq, h, d]. Every query block runs a
+  single softmax over the union of the keys it attends to. The first/last query
+  blocks are global (attend to all keys); blocks 1 and -2 sit next to the edge
+  and get an explicit block set; interior blocks combine the three components.
+  """
   b = q.shape[0]
   rand_attn = rand_attn.unsqueeze(0).expand(b, -1, -1, -1)
-  rand_mask = _create_rand_mask(
-      blocked_mask, rand_attn, num_heads, num_rand_blocks, block_size)
+  rand_mask = _create_rand_mask(blocked_mask, rand_attn, num_heads,
+                                num_rand_blocks, block_size)
 
   h, r, d = num_heads, num_rand_blocks, head_size
-  m = n = seq_length
-  wm = wn = block_size
-  scale = 1.0 / np.sqrt(d)
+  nb, wn = seq_length // block_size, block_size
+  scale = d ** -0.5
 
-  bq = q.reshape(-1, h, m // wm, wm, d)
-  bk = k.reshape(-1, h, n // wn, wn, d)
-  bv = v.reshape(-1, h, n // wn, wn, d)
-  gk = batched_index_gather(bk, rand_attn, 2).reshape(-1, h, m // wm - 2, r * wn, d)
-  gv = batched_index_gather(bv, rand_attn, 2).reshape(-1, h, m // wm - 2, r * wn, d)
+  bq = q.reshape(b, h, nb, wn, d)
+  bk = k.reshape(b, h, nb, wn, d)
+  bv = v.reshape(b, h, nb, wn, d)
+  # Keys/values of the random blocks each interior query block attends to.
+  gk = batched_index_gather(bk, rand_attn, 2).reshape(b, h, nb - 2, r * wn, d)
+  gv = batched_index_gather(bv, rand_attn, 2).reshape(b, h, nb - 2, r * wn, d)
 
-  # First block attends to everything.
-  first = torch.einsum("bhqd,bhkd->bhqk", bq[:, :, 0], k) * scale
-  first += (1.0 - to_mask) * -10000.0
-  first_ctx = torch.einsum("bhqk,bhkd->bhqd", first.softmax(-1), v).unsqueeze(2)
+  def attend(
+      q_block: Tensor,
+      key_mat: Tensor,
+      value_mat: Tensor,
+      add_mask: Tensor,
+  ) -> Tensor:
+    """softmax(q.kᵀ * scale + mask) . v over one explicit set of key blocks."""
+    scores = torch.einsum("bhqd,bhkd->bhqk", q_block, key_mat) * scale + add_mask
+    ctx = torch.einsum("bhqk,bhkd->bhqd", scores.softmax(-1), value_mat)
+    return ctx.unsqueeze(2)  # [b, h, 1, wn, d]
 
-  # Second block: first 3 + last + random blocks.
+  # --- global rows: first and last query blocks attend to all keys ---
+  first_ctx = attend(bq[:, :, 0], k, v, (1.0 - to_mask) * -10000.0)
+  last_ctx = attend(bq[:, :, -1], k, v, (1.0 - to_mask) * -10000.0)
+
+  # --- block 1: window {0,1,2} + global {last} + random ---
   second_k = torch.cat([bk[:, :, 0], bk[:, :, 1], bk[:, :, 2], bk[:, :, -1],
                         gk[:, :, 0]], 2)
   second_v = torch.cat([bv[:, :, 0], bv[:, :, 1], bv[:, :, 2], bv[:, :, -1],
                         gv[:, :, 0]], 2)
-  second = torch.einsum("bhqd,bhkd->bhqk", bq[:, :, 1], second_k) * scale
   seq_pad = torch.cat([to_mask[:, :, :, :3 * wn], to_mask[:, :, :, -wn:],
-                       torch.ones_like(rand_mask[:, :1, 0, :1])], 3)
-  rand_pad = torch.cat([torch.ones_like(second[:, :, :, :4 * wn]),
+                       rand_mask.new_ones(b, 1, 1, r * wn)], 3)
+  rand_pad = torch.cat([rand_mask.new_ones(b, h, wn, 4 * wn),
                         rand_mask[:, :, 0]], 3)
-  second += (1.0 - torch.minimum(seq_pad, rand_pad)) * -10000.0
-  second_ctx = torch.einsum(
-      "bhqk,bhkd->bhqd", second.softmax(-1), second_v).unsqueeze(2)
+  second_ctx = attend(bq[:, :, 1], second_k, second_v,
+                      (1.0 - torch.minimum(seq_pad, rand_pad)) * -10000.0)
 
-  # Middle blocks: sliding window (3 blocks) + first + last + random.
-  exp_k = torch.cat([bk[:, :, 1:-3], bk[:, :, 2:-2], bk[:, :, 3:-1]], 3)
-  exp_v = torch.cat([bv[:, :, 1:-3], bv[:, :, 2:-2], bv[:, :, 3:-1]], 3)
-  mid_q = bq[:, :, 2:-2]
-  inner = torch.einsum("bhlqd,bhlkd->bhlqk", mid_q, exp_k) * scale
-  rand = torch.einsum("bhlqd,bhlkd->bhlqk", mid_q, gk[:, :, 1:-1]) * scale
-  first_band = torch.einsum("bhlqd,bhkd->bhlqk", mid_q, bk[:, :, 0]) * scale
-  last_band = torch.einsum("bhlqd,bhkd->bhlqk", mid_q, bk[:, :, -1]) * scale
-  inner += (1.0 - band_mask) * -10000.0
-  first_band += (1.0 - to_mask[:, :, :, :wn].unsqueeze(3)) * -10000.0
-  last_band += (1.0 - to_mask[:, :, :, -wn:].unsqueeze(3)) * -10000.0
-  rand += (1.0 - rand_mask[:, :, 1:-1]) * -10000.0
-  band = torch.cat([first_band, inner, rand, last_band], -1).softmax(-1)
-  mid_ctx = torch.einsum("bhlqk,bhlkd->bhlqd", band[:, :, :, :, wn:4 * wn], exp_v)
-  mid_ctx += torch.einsum(
-      "bhlqk,bhlkd->bhlqd", band[:, :, :, :, 4 * wn:-wn], gv[:, :, 1:-1])
-  mid_ctx += torch.einsum(
-      "bhlqk,bhkd->bhlqd", band[:, :, :, :, :wn], bv[:, :, 0])
-  mid_ctx += torch.einsum(
-      "bhlqk,bhkd->bhlqd", band[:, :, :, :, -wn:], bv[:, :, -1])
-
-  # Second-to-last block: first + last 3 + random.
+  # --- block -2: global {0} + window {-3,-2,-1} + random ---
   sl_k = torch.cat([bk[:, :, 0], bk[:, :, -3], bk[:, :, -2], bk[:, :, -1],
                     gk[:, :, -1]], 2)
   sl_v = torch.cat([bv[:, :, 0], bv[:, :, -3], bv[:, :, -2], bv[:, :, -1],
                     gv[:, :, -1]], 2)
-  sl = torch.einsum("bhqd,bhkd->bhqk", bq[:, :, -2], sl_k) * scale
   sl_seq_pad = torch.cat([to_mask[:, :, :, :wn], to_mask[:, :, :, -3 * wn:],
-                          torch.ones_like(rand_mask[:, :1, 0, :1])], 3)
-  sl_rand_pad = torch.cat([torch.ones_like(sl[:, :, :, :4 * wn]),
+                          rand_mask.new_ones(b, 1, 1, r * wn)], 3)
+  sl_rand_pad = torch.cat([rand_mask.new_ones(b, h, wn, 4 * wn),
                            rand_mask[:, :, -1]], 3)
-  sl += (1.0 - torch.minimum(sl_seq_pad, sl_rand_pad)) * -10000.0
-  sl_ctx = torch.einsum("bhqk,bhkd->bhqd", sl.softmax(-1), sl_v).unsqueeze(2)
+  sl_ctx = attend(bq[:, :, -2], sl_k, sl_v,
+                  (1.0 - torch.minimum(sl_seq_pad, sl_rand_pad)) * -10000.0)
 
-  # Last block attends to everything.
-  last = torch.einsum("bhqd,bhkd->bhqk", bq[:, :, -1], k) * scale
-  last += (1.0 - to_mask) * -10000.0
-  last_ctx = torch.einsum("bhqk,bhkd->bhqd", last.softmax(-1), v).unsqueeze(2)
+  # --- interior blocks (2 .. nb-3): window + global + random, one softmax ---
+  mid_q = bq[:, :, 2:-2]
+  # window: the 3 sliding blocks {i-1, i, i+1}
+  window_k = torch.cat([bk[:, :, 1:-3], bk[:, :, 2:-2], bk[:, :, 3:-1]], 3)
+  window_v = torch.cat([bv[:, :, 1:-3], bv[:, :, 2:-2], bv[:, :, 3:-1]], 3)
+  window = torch.einsum("bhlqd,bhlkd->bhlqk", mid_q, window_k) * scale
+  window += (1.0 - band_mask) * -10000.0
+  # global: the first and last blocks
+  g_first = torch.einsum("bhlqd,bhkd->bhlqk", mid_q, bk[:, :, 0]) * scale
+  g_first += (1.0 - to_mask[:, :, :, :wn].unsqueeze(3)) * -10000.0
+  g_last = torch.einsum("bhlqd,bhkd->bhlqk", mid_q, bk[:, :, -1]) * scale
+  g_last += (1.0 - to_mask[:, :, :, -wn:].unsqueeze(3)) * -10000.0
+  # random: the r blocks picked per query block
+  rand = torch.einsum("bhlqd,bhlkd->bhlqk", mid_q, gk[:, :, 1:-1]) * scale
+  rand += (1.0 - rand_mask[:, :, 1:-1]) * -10000.0
+  # one shared softmax over [global-first | window | random | global-last]
+  probs = torch.cat([g_first, window, rand, g_last], -1).softmax(-1)
+  mid_ctx = torch.einsum("bhlqk,bhlkd->bhlqd", probs[..., wn:4 * wn], window_v)
+  mid_ctx += torch.einsum("bhlqk,bhlkd->bhlqd", probs[..., 4 * wn:-wn], gv[:, :, 1:-1])
+  mid_ctx += torch.einsum("bhlqk,bhkd->bhlqd", probs[..., :wn], bv[:, :, 0])
+  mid_ctx += torch.einsum("bhlqk,bhkd->bhlqd", probs[..., -wn:], bv[:, :, -1])
 
   ctx = torch.cat([first_ctx, second_ctx, mid_ctx, sl_ctx, last_ctx], 2)
-  ctx = ctx.reshape(-1, h, m, d) * from_mask
+  ctx = ctx.reshape(b, h, seq_length, d) * from_mask
   return ctx.permute(0, 2, 1, 3)
 
 
 class MultiHeadAttention(nn.Module):
-  """Self-attention with full (SDPA) or block-sparse implementation."""
+  """Encoder self-attention: full (SDPA) or block-sparse."""
 
-  def __init__(self, config, seed=0):
+  def __init__(self, config: TransformerConfig, seed: int = 0):
     super().__init__()
     self.config = config
     self.h = config.num_attention_heads
@@ -291,14 +200,22 @@ class MultiHeadAttention(nn.Module):
       self.register_buffer("rand_attn", build_rand_attn(config, seed),
                            persistent=False)
 
-  def _split(self, x):
+  def _split(self, x: Tensor) -> Tensor:
     b, s, _ = x.shape
     return x.view(b, s, self.h, self.d).transpose(1, 2)  # [b, h, s, d]
 
-  def forward(self, hidden, band_mask=None, from_mask=None, to_mask=None,
-              blocked_mask=None, attn_mask=None):
-    q, k, v = self._split(self.query(hidden)), self._split(
-        self.key(hidden)), self._split(self.value(hidden))
+  def forward(
+      self,
+      hidden: Tensor,
+      band_mask: Optional[Tensor] = None,
+      from_mask: Optional[Tensor] = None,
+      to_mask: Optional[Tensor] = None,
+      blocked_mask: Optional[Tensor] = None,
+      attn_mask: Optional[Tensor] = None,
+  ) -> Tensor:
+    q = self._split(self.query(hidden))
+    k = self._split(self.key(hidden))
+    v = self._split(self.value(hidden))
 
     if self.config.attention_type == "block_sparse":
       ctx = block_sparse_attention(
@@ -316,13 +233,9 @@ class MultiHeadAttention(nn.Module):
 
 
 class FullAttention(nn.Module):
-  """Standard multi-head attention for the decoder (self and cross).
+  """Decoder attention (self and cross), with an incremental key/value cache."""
 
-  Supports incremental decoding via a fixed-size key/value cache that is
-  written at position `decode_i`.
-  """
-
-  def __init__(self, config, seed=0):
+  def __init__(self, config: TransformerConfig, seed: int = 0):
     super().__init__()
     self.h = config.num_attention_heads
     self.d = config.head_size
@@ -332,12 +245,18 @@ class FullAttention(nn.Module):
     self.value = nn.Linear(hidden, hidden, bias=config.use_bias)
     self.dropout = config.attention_probs_dropout_prob
 
-  def _split(self, x):
+  def _split(self, x: Tensor) -> Tensor:
     b, s, _ = x.shape
     return x.view(b, s, self.h, self.d).transpose(1, 2)  # [b, h, s, d]
 
-  def forward(self, from_tensor, to_tensor, attn_mask=None,
-              cache=None, decode_i=None):
+  def forward(
+      self,
+      from_tensor: Tensor,
+      to_tensor: Tensor,
+      attn_mask: Optional[Tensor] = None,
+      cache: Optional[dict] = None,
+      decode_i: Optional[int] = None,
+  ) -> Tensor:
     q = self._split(self.query(from_tensor))
     k = self._split(self.key(to_tensor))
     v = self._split(self.value(to_tensor))
