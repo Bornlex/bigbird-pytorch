@@ -28,7 +28,7 @@ def fake_hf_state_dict(spec, pos_rows):
   sd = {
       f"{p}.embeddings.word_embeddings.weight": r(V, H),
       f"{p}.embeddings.position_embeddings.weight": r(pos_rows, H),
-      f"{p}.embeddings.token_type_embeddings.weight": r(spec.type_vocab_size, H),
+      f"{p}.embeddings.token_type_embeddings.weight": r(1, H),  # ignored
       f"{p}.embeddings.LayerNorm.weight": r(H),
       f"{p}.embeddings.LayerNorm.bias": r(H),
   }
@@ -53,12 +53,12 @@ def fake_hf_state_dict(spec, pos_rows):
   return sd
 
 
-def _spec(prefix, head, offset, type_vocab):
+def _spec(prefix, head, offset):
   return SourceSpec(prefix=prefix, head=head, position_offset=offset,
                     hidden_act="gelu_exact" if head == "roberta" else "gelu",
                     vocab_size=V, hidden_size=H, num_hidden_layers=L,
                     num_attention_heads=HEADS, intermediate_size=I,
-                    type_vocab_size=type_vocab, block_size=16, num_rand_blocks=2)
+                    block_size=16, num_rand_blocks=2)
 
 
 def _check(spec, pos_rows, target_pos):
@@ -69,9 +69,7 @@ def _check(spec, pos_rows, target_pos):
 
   model = BigBirdForMaskedLM(config)
   res = model.load_state_dict(sd, strict=False)
-  missing = [k for k in res.missing_keys
-             if "rand_attn" not in k and "pooler" not in k]
-  assert not missing, f"unexpectedly missing: {missing}"
+  assert not res.missing_keys, f"unexpectedly missing: {res.missing_keys}"
   assert not res.unexpected_keys, f"unexpected: {res.unexpected_keys}"
 
   # Position table tiled/truncated to the target length.
@@ -86,15 +84,13 @@ def _check(spec, pos_rows, target_pos):
 
 def test_roberta_source():
   # 512-style: fewer position rows than target -> tiled; offset 2.
-  _check(_spec("roberta", "roberta", offset=2, type_vocab=1),
-         pos_rows=2 + 64, target_pos=128)
+  _check(_spec("roberta", "roberta", offset=2), pos_rows=2 + 64, target_pos=128)
   print("[ok] roberta-base mapping (position tiling, offset 2)")
 
 
 def test_bigbird_source():
   # Already-long checkpoint: position rows match target; offset 0.
-  _check(_spec("bert", "bert", offset=0, type_vocab=2),
-         pos_rows=128, target_pos=128)
+  _check(_spec("bert", "bert", offset=0), pos_rows=128, target_pos=128)
   print("[ok] bigbird-roberta mapping (direct position copy)")
 
 

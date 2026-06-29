@@ -50,14 +50,17 @@ class SourceSpec:
   num_hidden_layers: int
   num_attention_heads: int
   intermediate_size: int
-  type_vocab_size: int
   block_size: int
   num_rand_blocks: int
 
 
 def convert_state_dict(hf_sd, spec, max_position_embeddings,
                        max_encoder_length, attention_type):
-  """Map a HuggingFace state_dict to our (config, state_dict)."""
+  """Map a HuggingFace state_dict to our (config, state_dict).
+
+  We deliberately drop the source's token-type embeddings and pooler: this
+  model does single-segment MLM, so they are unused here.
+  """
   config = MLMConfig(
       vocab_size=spec.vocab_size,
       hidden_size=spec.hidden_size,
@@ -65,7 +68,6 @@ def convert_state_dict(hf_sd, spec, max_position_embeddings,
       num_attention_heads=spec.num_attention_heads,
       intermediate_size=spec.intermediate_size,
       hidden_act=spec.hidden_act,
-      type_vocab_size=spec.type_vocab_size,
       max_position_embeddings=max_position_embeddings,
       max_encoder_length=max_encoder_length,
       attention_type=attention_type,
@@ -77,8 +79,6 @@ def convert_state_dict(hf_sd, spec, max_position_embeddings,
 
   # Embeddings.
   sd["bert.embeddings.word.weight"] = hf_sd[f"{p}.embeddings.word_embeddings.weight"]
-  sd["bert.embeddings.token_type.weight"] = hf_sd[
-      f"{p}.embeddings.token_type_embeddings.weight"]
   # Embedding LayerNorm == our initial (postnorm) encoder norm.
   sd["bert.encoder.norm.weight"] = hf_sd[f"{p}.embeddings.LayerNorm.weight"]
   sd["bert.encoder.norm.bias"] = hf_sd[f"{p}.embeddings.LayerNorm.bias"]
@@ -113,11 +113,6 @@ def convert_state_dict(hf_sd, spec, max_position_embeddings,
     sd["transform_norm.bias"] = hf_sd[f"{t}.LayerNorm.bias"]
     sd["bias"] = hf_sd["cls.predictions.bias"]
 
-  # Pooler (present only in some checkpoints; unused for MLM if absent).
-  if f"{p}.pooler.dense.weight" in hf_sd:
-    sd["bert.pooler.weight"] = hf_sd[f"{p}.pooler.dense.weight"]
-    sd["bert.pooler.bias"] = hf_sd[f"{p}.pooler.dense.bias"]
-
   return config, sd
 
 
@@ -142,7 +137,6 @@ def _spec_from_hf(hf_model, source):
       num_hidden_layers=c.num_hidden_layers,
       num_attention_heads=c.num_attention_heads,
       intermediate_size=c.intermediate_size,
-      type_vocab_size=c.type_vocab_size,
       block_size=getattr(c, "block_size", 64),
       num_rand_blocks=getattr(c, "num_random_blocks", 3))
 

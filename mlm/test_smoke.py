@@ -18,27 +18,24 @@ def small_config(**kw):
 
 def test_full_attention():
   cfg = small_config(max_encoder_length=128, attention_type="block_sparse")
-  model = BigBirdModel(cfg).eval()
-  seq, pooled = model(torch.randint(1, 256, (2, 128)))
-  assert seq.shape == (2, 128, 32) and pooled.shape == (2, 32)
+  seq = BigBirdModel(cfg).eval()(torch.randint(1, 256, (2, 128)))
+  assert seq.shape == (2, 128, 32)
   print("[ok] full attention (short seq):", tuple(seq.shape))
 
 
 def test_block_sparse():
   cfg = small_config(max_encoder_length=1024, attention_type="block_sparse")
-  model = BigBirdModel(cfg).eval()
-  seq, pooled = model(torch.randint(1, 256, (2, 1024)))
+  seq = BigBirdModel(cfg).eval()(torch.randint(1, 256, (2, 1024)))
   assert seq.shape == (2, 1024, 32)
   print("[ok] block sparse:", tuple(seq.shape))
 
 
-def test_prenorm_and_checkpointing():
-  cfg = small_config(max_encoder_length=1024, norm_type="prenorm",
-                     use_gradient_checkpointing=True)
+def test_gradient_checkpointing():
+  cfg = small_config(max_encoder_length=1024, use_gradient_checkpointing=True)
   model = BigBirdModel(cfg).train()
-  seq, pooled = model(torch.randint(1, 256, (2, 1024)))
-  (seq.pow(2).mean() + pooled.pow(2).mean()).backward()
-  print("[ok] prenorm + gradient checkpointing backward")
+  seq = model(torch.randint(1, 256, (2, 1024)))
+  seq.pow(2).mean().backward()
+  print("[ok] gradient checkpointing backward")
 
 
 def test_mlm_forward_backward():
@@ -76,7 +73,7 @@ if __name__ == "__main__":
   torch.manual_seed(0)
   test_full_attention()
   test_block_sparse()
-  test_prenorm_and_checkpointing()
+  test_gradient_checkpointing()
   test_mlm_forward_backward()
   test_masking_dataset()
   print("\nAll MLM smoke tests passed.")

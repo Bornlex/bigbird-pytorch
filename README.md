@@ -93,7 +93,8 @@ index 2 and has only 512 rows), the embedding-LayerNorm ↔ encoder-norm
 correspondence, and the gelu variant (exact for RoBERTa, tanh for BigBird). The
 **tokenizer must match the word embeddings** — use RoBERTa's BPE with
 `roberta-base`, and BigBird's SentencePiece with `google/bigbird-roberta-base`.
-The pooler is not warm-started (it's unused for MLM).
+The source's token-type embeddings and pooler are dropped (this model does
+single-segment MLM, so neither is used).
 
 ## Seq2seq (encoder-decoder)
 
@@ -120,11 +121,13 @@ pred_ids = model(input_ids, training=False)["pred_ids"]   # beam search
 - **Attention.** For `max_encoder_length <= 512` the model falls back to full
   attention automatically (it's the standard BERT/RoBERTa setup at that point).
   Block-sparse pads the sequence up to a multiple of `block_size`.
-- **GELU** uses the tanh approximation; **LayerNorm** uses `eps=1e-12`.
-- **norm_type** is `postnorm` (BERT/RoBERTa) by default; set `prenorm` for the
-  Pegasus-style setup (more stable when training from scratch).
-- **Checkpoints.** This is a from-scratch implementation; loading the official
-  TF BigBird weights would need a name-mapping script (not included yet).
+- **GELU** uses the tanh approximation by default (`gelu_exact` for RoBERTa);
+  **LayerNorm** uses `eps=1e-12`.
+- **Norm style.** `mlm/` is postnorm only (BERT/RoBERTa), since that's what MLM
+  and the RoBERTa warm-start use. `transformer/` keeps both postnorm and the
+  prenorm (Pegasus) style via `norm_type`.
+- **Single segment.** `mlm/` has no token-type embeddings or pooler — they are
+  unused for single-segment masked-LM pretraining.
 
 ## Tests
 
